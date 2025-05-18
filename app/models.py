@@ -5,15 +5,28 @@ from datetime import datetime
 
 # --- Input Models ---
 
+# +++ NEW MODEL FOR INDIVIDUAL SENTIMENT SCORE +++
+class SentimentScoreEntry(BaseModel):
+    label: str
+    score: float
+# ++++++++++++++++++++++++++++++++++++++++++++++++
+
 class ProcessedDocumentInput(BaseModel):
     raw_mongo_id: str = Field(..., description="Unique identifier for the original document")
     original_timestamp: datetime = Field(..., description="Timestamp of the original document")
-    overall_sentiment_scores: List[Dict[str, float]] = Field(
+    # overall_sentiment_scores: List[Dict[str, float]] = Field( # <<< OLD DEFINITION
+    overall_sentiment_scores: List[SentimentScoreEntry] = Field( # <<< NEW DEFINITION using SentimentScoreEntry
         ..., 
-        alias="overall_sentiment", 
+        alias="overall_sentiment",  
         description="List of sentiment scores, e.g., [{'label': 'Concerned', 'score': 0.7}]"
     )
-    extracted_keywords_frequency: List[Dict[str, Any]] = Field(
+    extracted_keywords_frequency: List[Dict[str, Any]] = Field( 
+        # For extracted_keywords_frequency, Dict[str, Any] is fine as frequency should be int.
+        # If you wanted to be stricter, you could make another model:
+        # class KeywordFrequencyEntry(BaseModel):
+        #     keyword: str
+        #     frequency: int
+        # extracted_keywords_frequency: List[KeywordFrequencyEntry]
         ..., 
         description="List of extracted keywords and their frequencies from the document, e.g., [{'keyword': 'fever', 'frequency': 2}]"
     )
@@ -26,6 +39,7 @@ class SignalExtractionRequest(BaseModel):
     timeframe_end: datetime = Field(..., description="End of the aggregation timeframe")
 
 # --- Output Models ---
+# (These Output Models were already correctly defined and do not need changes for this fix)
 
 class AggregatedKeyword(BaseModel):
     keyword: str
