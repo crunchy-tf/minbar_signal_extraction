@@ -1,0 +1,5 @@
+fastapi>=0.104.1 # Pinned for consistency
+uvicorn[standard]>=0.23.2 # Pinned for consistency
+loguru>=0.7.2 # Pinned for consistency
+pydantic>=2.5.2 # Pinned for consistency
+numpy>=1.26.0 # Though not heavily used directly, good to have for potential future numerical tasks
