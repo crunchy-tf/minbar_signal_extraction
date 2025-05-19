@@ -2,51 +2,52 @@
 from typing import List, Dict, Any, Optional
 from collections import Counter, defaultdict
 from datetime import datetime
-import numpy as np # Though not strictly needed for the current raw freq/avg score
+# import numpy as np # Not strictly needed here currently
 from loguru import logger
 
-from app.models import ProcessedDocumentInput, AggregatedSentiment, AggregatedKeyword, ExtractedSignal
+# Assuming ProcessedDocumentInput, AggregatedSentiment, etc. are in app.models
+# from app.models import ProcessedDocumentInput, AggregatedSentiment, AggregatedKeyword, ExtractedSignal 
+# For clarity, let's assume the Pydantic models are accessible.
+# If you run this file standalone for testing, you'd need to define or import them.
+from app.models import ProcessedDocumentInput, AggregatedSentiment, AggregatedKeyword, ExtractedSignal, SentimentScoreEntry # Added SentimentScoreEntry
 from app.config import HEALTHCARE_SENTIMENT_LABELS, TOP_N_AGGREGATED_KEYWORDS
 
 def aggregate_sentiment_scores(documents: List[ProcessedDocumentInput]) -> AggregatedSentiment:
     if not documents:
         return AggregatedSentiment(
             average_scores={label: 0.0 for label in HEALTHCARE_SENTIMENT_LABELS},
-            dominant_sentiment_label="Neutral", # Default if no docs
+            dominant_sentiment_label="Neutral",
             dominant_sentiment_score=0.0
         )
 
-    # Initialize sums and counts for each sentiment label
     label_score_sums: Dict[str, float] = {label: 0.0 for label in HEALTHCARE_SENTIMENT_LABELS}
-    # Number of documents that contributed to each label's score sum (not strictly needed if we average over total valid docs)
-    # label_doc_counts: Dict[str, int] = {label: 0 for label in HEALTHCARE_SENTIMENT_LABELS}
-    
     valid_docs_with_sentiment = 0
 
     for doc in documents:
-        if doc.overall_sentiment_scores: # Check if the document has sentiment scores
-            has_scores_for_this_doc = False
-            for score_entry in doc.overall_sentiment_scores:
-                label = score_entry.get("label")
-                score = score_entry.get("score")
+        if doc.overall_sentiment_scores:
+            has_valid_scores_for_this_doc = False
+            for score_entry in doc.overall_sentiment_scores: # score_entry is a SentimentScoreEntry object
+                # --- CORRECTED ACCESS ---
+                label = score_entry.label 
+                score = score_entry.score
+                # --- END CORRECTION ---
+                
                 if label in HEALTHCARE_SENTIMENT_LABELS and isinstance(score, (float, int)):
                     label_score_sums[label] += score
-                    # label_doc_counts[label] += 1 # Count if a doc mentions a label
-                    has_scores_for_this_doc = True
-            if has_scores_for_this_doc:
+                    has_valid_scores_for_this_doc = True
+            if has_valid_scores_for_this_doc:
                 valid_docs_with_sentiment += 1
                 
     average_scores: Dict[str, float] = {}
     if valid_docs_with_sentiment > 0:
         for label in HEALTHCARE_SENTIMENT_LABELS:
             average_scores[label] = label_score_sums[label] / valid_docs_with_sentiment
-    else: # No documents had any valid sentiment scores
+    else:
         average_scores = {label: 0.0 for label in HEALTHCARE_SENTIMENT_LABELS}
 
     dominant_label: Optional[str] = None
-    max_avg_score: float = -1.0 # Scores are typically 0-1
+    max_avg_score: float = -1.0 
 
-    # Determine dominant sentiment (excluding Neutral if other sentiments have higher scores)
     non_neutral_max_score = -1.0
     dominant_non_neutral_label = None
 
@@ -54,21 +55,17 @@ def aggregate_sentiment_scores(documents: List[ProcessedDocumentInput]) -> Aggre
         if label != "Neutral" and avg_score > non_neutral_max_score:
             non_neutral_max_score = avg_score
             dominant_non_neutral_label = label
-        if avg_score > max_avg_score: # Overall max including neutral
-             max_avg_score = avg_score
-             # dominant_label = label # This would make neutral dominant if it's highest
-
-    if dominant_non_neutral_label and non_neutral_max_score > average_scores.get("Neutral", 0.0):
+    
+    # Determine dominant based on highest score, preferring non-neutral if it's truly highest
+    if dominant_non_neutral_label and non_neutral_max_score >= average_scores.get("Neutral", -1.0): # Use >= to ensure preference
         dominant_label = dominant_non_neutral_label
         max_avg_score = non_neutral_max_score
-    elif average_scores: # If non_neutral_max_score was not higher, or no non-neutral scores
-        # Fallback to highest score overall, which could be Neutral
+    elif average_scores: # If non_neutral wasn't dominant or no non_neutral scores
         dominant_label = max(average_scores, key=average_scores.get)
-        max_avg_score = average_scores[dominant_label]
-    else: # Should not happen if average_scores is populated
+        max_avg_score = average_scores.get(dominant_label, 0.0)
+    else:
         dominant_label = "Neutral"
         max_avg_score = 0.0
-
 
     return AggregatedSentiment(
         average_scores=average_scores,
@@ -84,15 +81,16 @@ def aggregate_keywords_frequency(documents: List[ProcessedDocumentInput]) -> Lis
     keyword_document_occurrence: Dict[str, int] = defaultdict(int)
 
     for doc in documents:
-        # Track keywords already seen in this document to count document frequency correctly
         keywords_in_current_doc: set[str] = set()
         if doc.extracted_keywords_frequency:
-            for kw_entry in doc.extracted_keywords_frequency:
-                keyword = kw_entry.get("keyword")
-                frequency = kw_entry.get("frequency", 0) # Default to 0 if missing
+            for kw_entry in doc.extracted_keywords_frequency: # kw_entry is Dict[str, Any]
+                # --- CORRECTED ACCESS for consistency, though .get() works for dicts ---
+                keyword = kw_entry.get("keyword") 
+                frequency = kw_entry.get("frequency", 0)
+                # --- END CORRECTION ---
                 
                 if keyword and isinstance(keyword, str) and isinstance(frequency, int) and frequency > 0:
-                    keyword = keyword.lower().strip() # Normalize keyword
+                    keyword = keyword.lower().strip()
                     if not keyword: continue
 
                     overall_keyword_total_frequency[keyword] += frequency
@@ -106,11 +104,10 @@ def aggregate_keywords_frequency(documents: List[ProcessedDocumentInput]) -> Lis
             AggregatedKeyword(
                 keyword=keyword,
                 total_frequency=total_freq,
-                document_frequency=keyword_document_occurrence.get(keyword, 0) # Should always be found if total_freq > 0
+                document_frequency=keyword_document_occurrence.get(keyword, 0)
             )
         )
     return aggregated_keywords_list
-
 
 def create_aggregated_signal(
     topic_id: Any,
@@ -127,7 +124,6 @@ def create_aggregated_signal(
     agg_sentiment = aggregate_sentiment_scores(documents_for_topic)
     agg_keywords = aggregate_keywords_frequency(documents_for_topic)
     
-    # Timestamp for the signal point - typically the end of the aggregation window
     signal_ts = timeframe_end 
 
     return ExtractedSignal(
