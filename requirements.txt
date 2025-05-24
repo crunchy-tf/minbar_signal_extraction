@@ -10,5 +10,5 @@ asyncpg>=0.27.0 # For PostgreSQL & TimescaleDB
 # --- Scheduler ---
 apscheduler>=3.10.4
 
-# --- Optional: For calling Keyword Manager API ---
-# httpx>=0.25.0
+# --- For calling Keyword Manager API ---
+httpx>=0.25.0
