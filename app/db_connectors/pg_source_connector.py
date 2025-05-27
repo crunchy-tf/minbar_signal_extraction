@@ -7,20 +7,18 @@ from datetime import datetime, timezone
 from app.config import settings
 
 _source_pool: Optional[asyncpg.Pool] = None
-_source_table_checked_for_status_field = False # This flag will now cover both status and its specific timestamp
+_source_table_checked_for_status_field = False
 
 async def connect_db():
     global _source_pool, _source_table_checked_for_status_field
     if _source_pool and not getattr(_source_pool, '_closed', True):
         logger.debug("Source PostgreSQL connection pool already established.")
-        # If pool exists but table/fields weren't checked (e.g., previous attempt failed before check)
         if not _source_table_checked_for_status_field:
             logger.info("Pool exists, but source table status field status unknown. Attempting check/creation.")
             try:
                 await ensure_status_field_in_source_table()
             except Exception as table_err:
                 logger.error(f"Failed to check/ensure fields in source table on existing pool: {table_err}")
-                # Potentially close pool if check is critical and fails, or let it be handled by health checks
         return
 
     logger.info(f"Connecting to Source PostgreSQL database: {settings.source_postgres_dsn_asyncpg}")
@@ -30,7 +28,7 @@ async def connect_db():
             min_size=1,
             max_size=5
         )
-        await ensure_status_field_in_source_table() # This will now check for both fields
+        await ensure_status_field_in_source_table()
         logger.success("Source PostgreSQL connection pool established and table fields checked.")
     except Exception as e:
         logger.critical(f"Failed to connect to Source PostgreSQL: {e}", exc_info=True)
@@ -50,32 +48,25 @@ async def close_db():
 async def get_source_pool() -> asyncpg.Pool:
     if _source_pool is None or getattr(_source_pool, '_closed', True):
         logger.warning("Source PostgreSQL pool is None or closed. Attempting to (re)initialize...")
-        await connect_db() # connect_db handles initialization and ensures pool is not None on success
-    if _source_pool is None: # Check again after attempt
+        await connect_db()
+    if _source_pool is None:
         raise ConnectionError("Source PostgreSQL pool unavailable after re-initialization attempt.")
     return _source_pool
 
 async def ensure_status_field_in_source_table():
-    """
-    Ensures the status field (from settings) AND the specific 'signal_extraction_timestamp'
-    field exist in the source table. The NLP Analyzer is primarily responsible for creating these,
-    this function acts as a verification and a robust fallback if the timestamp field was missed.
-    """
     global _source_table_checked_for_status_field
     if _source_table_checked_for_status_field:
         logger.debug(f"Source table '{settings.SOURCE_NLP_RESULTS_TABLE}' fields already checked in this session.")
         return
 
     pool = await get_source_pool()
-    status_field_to_check = settings.SIGNAL_EXTRACTION_STATUS_FIELD_IN_SOURCE # This is 'signal_extraction_status'
-    # THIS IS THE KEY CHANGE: We explicitly define the timestamp field name we expect.
+    status_field_to_check = settings.SIGNAL_EXTRACTION_STATUS_FIELD_IN_SOURCE
     timestamp_field_to_check = "signal_extraction_timestamp"
     table_name = settings.SOURCE_NLP_RESULTS_TABLE
 
     logger.info(f"Ensuring status field '{status_field_to_check}' and timestamp field '{timestamp_field_to_check}' exist in source table '{table_name}'...")
     try:
         async with pool.acquire() as conn:
-            # 1. Check for the main status field (e.g., 'signal_extraction_status')
             status_field_exists = await conn.fetchval(f"""
                 SELECT EXISTS (
                     SELECT FROM information_schema.columns
@@ -84,19 +75,10 @@ async def ensure_status_field_in_source_table():
             """, table_name, status_field_to_check)
 
             if not status_field_exists:
-                logger.error(f"CRITICAL: Main status field '{status_field_to_check}' NOT FOUND in source table '{table_name}'. "
-                             f"The NLP Analyzer service is responsible for creating this field. "
-                             f"This service will likely fail to query or update status correctly.")
-                # Optionally, you could attempt to add it here as a very defensive measure,
-                # but it's better if the upstream service (NLP Analyzer) creates its own output schema correctly.
-                # For now, we log an error and proceed, relying on NLP Analyzer to have created it.
-                # If it's absolutely critical to add it here if missing:
-                # await conn.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {status_field_to_check} VARCHAR(50) DEFAULT 'pending';")
-                # logger.warning(f"Attempted to add missing main status field '{status_field_to_check}'. Review NLP Analyzer.")
+                logger.error(f"CRITICAL: Main status field '{status_field_to_check}' NOT FOUND in source table '{table_name}'.")
             else:
                 logger.debug(f"Verified: Main status field '{status_field_to_check}' exists in source table '{table_name}'.")
 
-            # 2. Check for the specific timestamp field (e.g., 'signal_extraction_timestamp')
             timestamp_field_exists = await conn.fetchval(f"""
                 SELECT EXISTS (
                     SELECT FROM information_schema.columns
@@ -105,47 +87,74 @@ async def ensure_status_field_in_source_table():
             """, table_name, timestamp_field_to_check)
 
             if not timestamp_field_exists:
-                logger.warning(f"Timestamp field '{timestamp_field_to_check}' NOT FOUND in source table '{table_name}'. "
-                               f"The NLP Analyzer service should have created this. This service will attempt to add it now for robustness.")
+                logger.warning(f"Timestamp field '{timestamp_field_to_check}' NOT FOUND in source table '{table_name}'. Attempting to add.")
                 try:
                     await conn.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {timestamp_field_to_check} TIMESTAMPTZ;")
                     logger.success(f"Successfully added missing timestamp field '{timestamp_field_to_check}' to '{table_name}'.")
                 except Exception as alter_e:
-                    logger.error(f"Failed to add missing timestamp field '{timestamp_field_to_check}' to '{table_name}': {alter_e}. "
-                                 f"Marking documents might fail.")
-                    # If adding fails, subsequent updates will fail.
-                    # _source_table_checked_for_status_field should remain False or this function should raise.
-                    raise # Re-raise to indicate a critical setup problem.
+                    logger.error(f"Failed to add missing timestamp field '{timestamp_field_to_check}' to '{table_name}': {alter_e}.")
+                    raise
             else:
                 logger.debug(f"Verified: Timestamp field '{timestamp_field_to_check}' exists in source table '{table_name}'.")
 
-        _source_table_checked_for_status_field = True # Both checks passed (or add attempted)
+        _source_table_checked_for_status_field = True
         logger.success(f"Source table '{table_name}' checks complete for necessary fields.")
     except Exception as e:
         logger.error(f"Error during field verification/addition in source table '{table_name}': {e}", exc_info=True)
-        _source_table_checked_for_status_field = False # Allow retry on next startup/call
-        raise # Re-raise so startup process knows there's an issue.
-
+        _source_table_checked_for_status_field = False
+        raise
 
 async def fetch_nlp_results_for_signal_extraction(limit: int) -> List[Dict[str, Any]]:
     pool = await get_source_pool()
-    # Query remains the same as it uses settings.SIGNAL_EXTRACTION_STATUS_FIELD_IN_SOURCE
+    
+    # --- MODIFIED QUERY WITH STRICTER FILTERS ---
+    # For JSONB fields, 'IS NOT NULL' checks if the field itself is NULL.
+    # To check for empty JSONB arrays like '[]' or empty objects '{}',
+    # you can use jsonb_array_length or compare to '[]'::jsonb / '{}'::jsonb.
+    # For simplicity and common usage, IS NOT NULL often suffices if empty arrays/objects are treated as "not empty".
+    # If an empty array `[]` should be skipped, you'd use `jsonb_array_length(overall_sentiment) > 0`.
+    # The prompt said "cant be empty", which for JSONB could mean not NULL and not an empty structure.
+    # Let's assume "cant be empty" means the JSONB field itself is not NULL and, if it's an array, it's not an empty array '[]'.
+    # PostgreSQL's NULL is different from an empty JSON array '[]' or empty JSON object '{}'.
+    # `overall_sentiment IS NOT NULL` is the first check.
+    # `jsonb_typeof(overall_sentiment) = 'array' AND jsonb_array_length(overall_sentiment) > 0` for non-empty array.
+
     query = f"""
-        SELECT id, raw_mongo_id, source, original_timestamp, retrieved_by_keyword,
-               keyword_concept_id, original_keyword_language, 
-               detected_language, overall_sentiment, assigned_topics, extracted_keywords_frequency
+        SELECT 
+            id, raw_mongo_id, source, original_timestamp, retrieved_by_keyword,
+            keyword_concept_id, original_keyword_language,
+            detected_language, overall_sentiment, assigned_topics, 
+            extracted_keywords_frequency, sentiment_on_extracted_keywords_summary 
+            -- Select sentiment_on_extracted_keywords_summary as it's now required
         FROM {settings.SOURCE_NLP_RESULTS_TABLE}
-        WHERE {settings.SIGNAL_EXTRACTION_STATUS_FIELD_IN_SOURCE} = 'pending'
-           OR {settings.SIGNAL_EXTRACTION_STATUS_FIELD_IN_SOURCE} = 'failed_extraction'
+        WHERE 
+            ({settings.SIGNAL_EXTRACTION_STATUS_FIELD_IN_SOURCE} = 'pending' OR
+             {settings.SIGNAL_EXTRACTION_STATUS_FIELD_IN_SOURCE} = 'failed_extraction')
+        AND raw_mongo_id IS NOT NULL AND raw_mongo_id != ''
+        AND source IS NOT NULL AND source != ''
+        AND detected_language IN ('en', 'fr', 'ar') -- Ensures detected_language is one of these
+        -- Conditions for JSONB fields to be non-NULL and non-empty arrays
+        -- (jsonb_typeof is useful to distinguish between null, array, object, string, number, boolean)
+        AND overall_sentiment IS NOT NULL 
+            AND jsonb_typeof(overall_sentiment) = 'array' AND jsonb_array_length(overall_sentiment) > 0
+        AND assigned_topics IS NOT NULL
+            AND jsonb_typeof(assigned_topics) = 'array' AND jsonb_array_length(assigned_topics) > 0
+        AND extracted_keywords_frequency IS NOT NULL
+            AND jsonb_typeof(extracted_keywords_frequency) = 'array' AND jsonb_array_length(extracted_keywords_frequency) > 0
+        AND sentiment_on_extracted_keywords_summary IS NOT NULL -- Added this condition
+            AND jsonb_typeof(sentiment_on_extracted_keywords_summary) = 'array' AND jsonb_array_length(sentiment_on_extracted_keywords_summary) > 0
+            
         ORDER BY original_timestamp ASC
         LIMIT $1;
     """
+    # --- END MODIFIED QUERY ---
+
     try:
         records = await pool.fetch(query, limit)
-        logger.info(f"Fetched {len(records)} NLP result documents for signal extraction from '{settings.SOURCE_NLP_RESULTS_TABLE}'.")
+        logger.info(f"Fetched {len(records)} NLP result documents meeting strict criteria from '{settings.SOURCE_NLP_RESULTS_TABLE}'.")
         return [dict(record) for record in records]
     except Exception as e:
-        logger.error(f"Error fetching NLP results from '{settings.SOURCE_NLP_RESULTS_TABLE}': {e}", exc_info=True)
+        logger.error(f"Error fetching strictly filtered NLP results from '{settings.SOURCE_NLP_RESULTS_TABLE}': {e}", exc_info=True)
         return []
 
 async def mark_nlp_results_as_signal_extracted(
@@ -157,12 +166,8 @@ async def mark_nlp_results_as_signal_extracted(
         return 0
 
     pool = await get_source_pool()
-    status_field_to_update = settings.SIGNAL_EXTRACTION_STATUS_FIELD_IN_SOURCE # e.g., 'signal_extraction_status'
-    
-    # --- THIS IS THE KEY CHANGE ---
-    # Use the exact column name that exists in the database, as confirmed by your `SELECT *` query.
+    status_field_to_update = settings.SIGNAL_EXTRACTION_STATUS_FIELD_IN_SOURCE
     timestamp_field_to_update = "signal_extraction_timestamp" 
-    # --- END KEY CHANGE ---
 
     logger.debug(f"Attempting to update status to '{status}' using status field '{status_field_to_update}' and timestamp field '{timestamp_field_to_update}'.")
 
@@ -191,8 +196,6 @@ async def mark_nlp_results_as_signal_extracted(
         logger.info(f"Marked {updated_count} NLP results as signal extraction status '{status}' in '{settings.SOURCE_NLP_RESULTS_TABLE}'.")
         return updated_count
     except asyncpg.exceptions.UndefinedColumnError as col_err:
-        # This error should now be less likely if ensure_status_field_in_source_table runs correctly
-        # and if the timestamp_field_to_update is correctly "signal_extraction_timestamp"
         logger.error(f"Column error marking NLP results: {col_err}. This is unexpected if schema checks passed. "
                      f"Attempted to update status field '{status_field_to_update}' and timestamp field '{timestamp_field_to_update}'.")
         return 0
